@@ -1,0 +1,8 @@
+pylint==3.3.6
+pytest==8.3.5
+pytest-asyncio==0.26.0
+viam-sdk>=0.30.0
+lerobot
+typing_extensions
+pyinstaller
+imageio

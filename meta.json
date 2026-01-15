@@ -1,0 +1,21 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "jalen:lerobot",
+  "visibility": "private",
+  "url": "",
+  "description": "A Viam module implementing the LeRobot service for robot learning and teleoperation",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:jalen:lerobot"
+    }
+  ],
+  "applications": null,
+  "entrypoint": "dist/main",
+  "build": {
+    "build": "./build.sh",
+    "path": "dist/archive.tar.gz",
+    "setup": "./setup.sh",
+    "arch": ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"]
+  }
+}

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_viam_robot"
+version = "0.1.0"
+description = "Viam robot wrapper implementation for LeRobot"
+requires-python = ">=3.8"
+dependencies = [
+    "lerobot",
+    "viam-sdk",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

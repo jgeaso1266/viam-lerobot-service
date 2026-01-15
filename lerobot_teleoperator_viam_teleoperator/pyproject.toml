@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_viam_teleoperator"
+version = "0.1.0"
+description = "Viam teleoperator implementation for LeRobot"
+requires-python = ">=3.8"
+dependencies = [
+    "lerobot",
+    "viam-sdk",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
