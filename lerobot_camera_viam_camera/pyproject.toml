@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lerobot_teleoperator_viam_teleoperator"
+name = "lerobot_camera_viam_camera"
 version = "0.1.0"
-description = "Viam teleoperator implementation for LeRobot"
+description = "Viam camera wrapper implementation for LeRobot"
 requires-python = ">=3.10"
 dependencies = [
     "lerobot",
@@ -14,5 +14,5 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["lerobot_teleoperator_viam_teleoperator*"]
+include = ["lerobot_camera_viam_camera*"]
 exclude = ["*.egg-info"]

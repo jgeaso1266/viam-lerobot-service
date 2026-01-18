@@ -5,14 +5,17 @@ This module implements the LeRobot service interface for robot learning
 and teleoperation using the LeRobot framework.
 """
 
-from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
+import asyncio
+import time
+from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple, cast
+from dataclasses import dataclass, field
 import os
+import uuid
 
 from typing_extensions import Self
 
 from viam.components.arm import Arm
 from viam.components.camera import Camera
-from viam.components.input import Controller
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import ResourceName
@@ -24,18 +27,41 @@ from viam.utils import ValueTypes
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.robots.utils import make_robot_from_config
+from lerobot.teleoperators.utils import make_teleoperator_from_config
+from lerobot.scripts.lerobot_teleoperate import teleoperate, TeleoperateConfig
 
-from lerobot_robot_viam_robot.config_viam_robot import ViamRobotConfig
-from lerobot_robot_viam_robot.viam_robot import ViamRobotWrapper
-from lerobot_teleoperator_viam_teleoperator.config_viam_teleoperator import ViamTeleoperatorConfig
-from lerobot_teleoperator_viam_teleoperator.viam_teleoperator import ViamTeleopWrapper
-
-from src.teleoperate import TeleopSession, start_teleoperation, stop_teleoperation
-from src.record import start_recording, stop_recording
-from src.replay import replay_episode
-from src.policy import load_policy, run_policy_episode
+from lerobot_camera_viam_camera.lerobot_camera_viam_camera.config_viam_camera import ViamCameraConfig
+from lerobot_robot_viam_robot.lerobot_robot_viam_robot.config_viam_robot import ViamRobotConfig
+from lerobot_teleoperator_viam_teleoperator.lerobot_teleoperator_viam_teleoperator.config_viam_teleoperator import ViamTeleoperatorConfig
 
 LOGGER = getLogger(__name__)
+
+@dataclass
+class TeleopSession:
+    """Tracks state for a teleoperation session."""
+    fps: int
+    start_time: float = field(default_factory=time.time)
+    stop_requested: bool = False
+    stopped: bool = False
+    duration_s: float = 0.0
+    task: Optional[asyncio.Task] = field(default=None, repr=False)
+
+    async def wait_for_stop(self, timeout: float = 30.0):
+        """Wait until the session is fully stopped."""
+        try:
+            await asyncio.wait_for(self._wait_stopped(), timeout=timeout)
+        except asyncio.TimeoutError:
+            LOGGER.warning("Timeout waiting for session to stop, cancelling task")
+            if self.task and not self.task.done():
+                self.task.cancel()
+            self.stopped = True
+            self.duration_s = time.time() - self.start_time
+
+    async def _wait_stopped(self):
+        """Internal wait loop."""
+        while not self.stopped:
+            await asyncio.sleep(0.1)
 
 class MyLeRobotService(Generic, EasyResource):
     """
@@ -56,13 +82,12 @@ class MyLeRobotService(Generic, EasyResource):
         self.dataset: Optional[LeRobotDataset] = None
         self.dataset_dir: str = "./datasets"
         self.policy_dir: str = "./policies"
-        self.robot_wrapper: Optional[ViamRobotWrapper] = None
-        self.teleop_wrapper: Optional[ViamTeleopWrapper] = None
+        self.robot = None
+        self.teleop = None
         self.policy: PreTrainedPolicy = None
 
-        self.arm: Optional[Arm] = None
-        self.cameras: List[Camera] = []
-        self.teleop_device: Optional[Arm | Controller] = None
+        self.robot_config = None
+        self.teleop_config = None
 
         # Session tracking
         self.recording_sessions: Dict[str, Dict[str, Any]] = {}
@@ -117,74 +142,61 @@ class MyLeRobotService(Generic, EasyResource):
         self.config = config
         attrs = config.attributes.fields
 
-        if "dataset_dir" in attrs:
-            self.dataset_dir = attrs["dataset_dir"].string_value
-        else:
-            self.dataset_dir = "./datasets"
+        self.dataset_dir = attrs["dataset_dir"].string_value if "dataset_dir" in attrs \
+            else "./datasets"
+        self.policy_dir = attrs["policy_dir"].string_value if "policy_dir" in attrs \
+            else "./policies"
 
-        if "policy_dir" in attrs:
-            self.policy_dir = attrs["policy_dir"].string_value
-        else:
-            self.policy_dir = "./policies"
+        arm_name = attrs["arm"].string_value if "arm" in attrs else ""
+        teleop_name = attrs["teleop"].string_value if "teleop" in attrs else ""
+        camera_names = attrs.get("cameras", {}).list_value.values
 
-        if "arm" in attrs:
-            arm_name = attrs["arm"].string_value
-            arm_resource_name = Arm.get_resource_name(arm_name)
-            if arm_resource_name in dependencies:
-                self.arm = dependencies[arm_resource_name]
-            else:
-                LOGGER.warning("Arm %s not found in dependencies", arm_name)
+        arm = dependencies[Arm.get_resource_name(arm_name)]
+        arm = cast(Arm, arm)
 
-        if "teleop" in attrs:
-            teleop_name = attrs["teleop"].string_value
-            teleop_resource_name = Arm.get_resource_name(teleop_name)
-            if teleop_resource_name in dependencies:
-                self.teleop_device = dependencies[teleop_resource_name]
-            else:
-                LOGGER.warning("Teleop device %s not found in dependencies", teleop_name)
+        joint_positions = asyncio.run(arm.get_joint_positions())
+        num_joints = len(joint_positions.values)
 
-        if "cameras" in attrs:
-            camera_names = [
-                cam.string_value for cam in attrs["cameras"].list_value.values
-            ]
-            for cam_name in camera_names:
-                cam_resource_name = ResourceName.from_string(cam_name)
-                if cam_resource_name in dependencies:
-                    self.cameras.append(dependencies[cam_resource_name])
-                else:
-                    LOGGER.warning("Camera %s not found in dependencies", cam_name)
-
-        robot_config = ViamRobotConfig(
-            arm=arm_name if "arm" in attrs else "",
-            cameras=camera_names if "cameras" in attrs else [],
-            logger=LOGGER,
+        self.robot_config = ViamRobotConfig(
+            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
+            api_key_secret=os.environ.get("VIAM_API_KEY", ""),
+            robot_address=os.environ.get("VIAM_MACHINE_FQDN", ""),
+            robot_device_name=arm_name,
+            num_joints=num_joints
         )
 
-        teleop_config = ViamTeleoperatorConfig(
-            teleop_device=teleop_name if "teleop" in attrs else "",
-            fps=30,
-            logger=LOGGER,
+        self.teleop_config = ViamTeleoperatorConfig(
+            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
+            api_key_secret=os.environ.get("VIAM_API_KEY", ""),
+            robot_address=os.environ.get("VIAM_MACHINE_FQDN", ""),
+            teleop_device_name=teleop_name
         )
 
-        # Create robot wrapper with dependencies
-        self.robot_wrapper = ViamRobotWrapper(robot_config, dependencies)
-        self.teleop_wrapper = ViamTeleopWrapper(teleop_config, dependencies)
+        for cam_name in camera_names:
+            camera_name = cam_name.string_value
+            camera = dependencies[Camera.get_resource_name(camera_name)]
+            camera = cast(Camera, camera)
+
+            props = asyncio.run(camera.get_properties())
+
+            camera_config = ViamCameraConfig(
+                api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
+                api_key_secret=os.environ.get("VIAM_API_KEY", ""),
+                robot_address=os.environ.get("VIAM_MACHINE_FQDN", ""),
+                camera_device_name=camera_name,
+                width=props.intrinsic_parameters.width_px,
+                height=props.intrinsic_parameters.height_px,
+                fps=props.frame_rate
+            )
+            self.robot_config.cameras[camera_name] = camera_config
+
+        self.robot = make_robot_from_config(self.robot_config)
+        self.teleop = make_teleoperator_from_config(self.teleop_config)
 
         LOGGER.info(
             "LeRobot service configured: dataset_dir=%s, policy_dir=%s",
             self.dataset_dir, self.policy_dir
         )
-
-    start_teleoperation = start_teleoperation
-    stop_teleoperation = stop_teleoperation
-
-    start_recording = start_recording
-    stop_recording = stop_recording
-
-    replay_episode = replay_episode
-
-    load_policy = load_policy
-    run_policy_episode = run_policy_episode
 
     async def do_command(
         self,
@@ -196,98 +208,68 @@ class MyLeRobotService(Generic, EasyResource):
         """Handle arbitrary commands for extended functionality."""
         cmd = command.get("command", "")
 
-        if cmd == "list_datasets":
-            datasets = []
-            if os.path.exists(self.dataset_dir):
-                datasets = os.listdir(self.dataset_dir)
-            return {"datasets": datasets}
-
-        elif cmd == "push_to_hub":
-            dataset_name = command.get("dataset_name", "")
-            repo_id = command.get("repo_id", dataset_name)
-            # Push dataset to HuggingFace Hub
-            dataset = LeRobotDataset(repo_id=dataset_name, root=self.dataset_dir)
-            dataset.push_to_hub(repo_id=repo_id)
-            return {"status": "success", "repo_id": repo_id}
-
-        elif cmd == "get_dataset_info":
-            dataset_name = command.get("dataset_name", "")
-            dataset = LeRobotDataset(repo_id=dataset_name, root=self.dataset_dir)
-            return {
-                "repo_id": dataset.repo_id,
-                "num_episodes": dataset.num_episodes,
-                "num_frames": len(dataset),
-                "fps": dataset.fps,
-            }
-
-        elif cmd == "unload_policy":
-            policy_id = command.get("policy_id", "")
-            if policy_id in self.loaded_policies:
-                del self.loaded_policies[policy_id]
-                return {"status": "unloaded", "policy_id": policy_id}
-            return {"status": "not_found", "policy_id": policy_id}
-
-        elif cmd == "start_teleoperation":
-            teleop_device_type = command.get("teleop_device_type", "arm")
+        if cmd == "start_teleoperation":
             fps = int(command.get("fps", 30))
-            session_id = await self.start_teleoperation(teleop_device_type, fps)
+            teleop_time_s = int(command.get("teleop_time_s", 60))
+            display_data = bool(command.get("display_data", False))
+            display_ip = command.get("display_ip", None)
+            display_port = int(command.get("display_port", 0))
+            display_compressed_images = bool(command.get("display_compressed_images", False))
+
+            session_id = str(uuid.uuid4())
+            session = TeleopSession(
+                fps=fps
+            )
+            self.teleop_sessions[session_id] = session
+
+            cfg = TeleoperateConfig(
+                teleop = self.teleop_config,
+                robot = self.robot_config,
+                fps = fps,
+                teleop_time_s = teleop_time_s,
+                display_data = display_data,
+                display_ip = display_ip,
+                display_port = display_port,
+                display_compressed_images = display_compressed_images,
+            )
+
+            # Start teleoperation loop in background task
+            async def run_teleoperation():
+                try:
+                    await asyncio.to_thread(teleoperate, cfg)
+                except asyncio.CancelledError:
+                    LOGGER.info("Teleoperation session %s cancelled.", session_id)
+                except Exception as e:
+                    LOGGER.error("Teleoperation session %s error: %s", session_id, e)
+                finally:
+                    session.duration_s = time.time() - session.start_time
+                    session.stopped = True
+
+            session.task = asyncio.create_task(run_teleoperation())
+
+            LOGGER.info("Started teleoperation session %s.", session_id)
+
             return {"session_id": session_id, "active_sessions": list(self.teleop_sessions.keys())}
 
         elif cmd == "stop_teleoperation":
             session_id = command.get("session_id", "")
-            duration_s = await self.stop_teleoperation(session_id)
+            session = self.teleop_sessions.get(session_id)
+            if not session:
+                raise ValueError(f"Unknown session: {session_id}")
+
+            session.stop_requested = True
+
+            # Cancel the background task if still running
+            if session.task and not session.task.done():
+                session.task.cancel()
+
+            await session.wait_for_stop()
+
+            duration_s = session.duration_s
+            del self.teleop_sessions[session_id]
+
+            LOGGER.info("Stopped teleoperation session %s, duration: %.2fs", session_id, duration_s)
             return {"duration_s": duration_s, "active_sessions": list(self.teleop_sessions.keys())}
-
-        elif cmd == "start_recording":
-            dataset_name = command.get("dataset_name", "")
-            session_id = await self.start_recording(dataset_name)
-            return {
-                "session_id": session_id, 
-                "active_sessions": list(self.recording_sessions.keys())
-            }
-
-        elif cmd == "stop_recording":
-            session_id = command.get("session_id", "")
-            duration_s = await self.stop_recording(session_id)
-            return {
-                "duration_s": duration_s,
-                "active_sessions": list(self.recording_sessions.keys())
-            }
-
-        elif cmd == "replay_episode":
-            dataset_name = command.get("dataset_name", "")
-            episode_index = int(command.get("episode_index", 0))
-            fps = int(command.get("fps", 30))
-            result = await self.replay_episode(
-                dataset_name,
-                episode_index,
-                fps=fps,
-            )
-            return result
-
-        elif cmd == "load_policy":
-            policy_repo_id = command.get("policy_repo_id", "")
-            result = await self.load_policy(policy_repo_id)
-            return result
-
-        elif cmd == "run_policy_episode":
-            policy_id = command.get("policy_id", "")
-            task = command.get("task", "")
-            max_steps = int(command.get("max_steps", 1000))
-            fps = int(command.get("fps", 30))
-            record_to_dataset = bool(command.get("record_to_dataset", False))
-            dataset_name = command.get("dataset_name", "")
-            episode_index = int(command.get("episode_index", 0))
-            result = await self.run_policy_episode(
-                policy_id,
-                task,
-                max_steps=max_steps,
-                fps=fps,
-                record_to_dataset=record_to_dataset,
-                dataset_name=dataset_name,
-                episode_index=episode_index,
-            )
-            return result
 
         LOGGER.info("Received do_command: %s", command)
         return dict(command)
@@ -296,16 +278,12 @@ class MyLeRobotService(Generic, EasyResource):
         """Clean up resources when the service is stopped."""
         LOGGER.info("Closing LeRobot service %s", self.name)
 
-        # Stop any active teleoperation sessions
-        for session_id in list(self.teleop_sessions.keys()):
-            try:
-                await self.stop_teleoperation(session_id)
-            except Exception as e:
-                LOGGER.warning("Error stopping teleoperation %s: %s", session_id, e)
-
         # Disconnect robot
-        if self.robot_wrapper and self.robot_wrapper.is_connected:
-            await self.robot_wrapper.disconnect()
+        if self.robot and self.robot.is_connected:
+            self.robot.disconnect()
+
+        if self.teleop and self.teleop.is_connected:
+            self.teleop.disconnect()
 
         # Clear state
         self.recording_sessions.clear()
