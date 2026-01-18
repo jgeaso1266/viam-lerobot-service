@@ -27,8 +27,6 @@ from viam.utils import ValueTypes
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.robots.utils import make_robot_from_config
-from lerobot.teleoperators.utils import make_teleoperator_from_config
 from lerobot.scripts.lerobot_teleoperate import teleoperate, TeleoperateConfig
 
 from lerobot_camera_viam_camera.lerobot_camera_viam_camera.config_viam_camera import ViamCameraConfig
@@ -82,12 +80,10 @@ class MyLeRobotService(Generic, EasyResource):
         self.dataset: Optional[LeRobotDataset] = None
         self.dataset_dir: str = "./datasets"
         self.policy_dir: str = "./policies"
-        self.robot = None
-        self.teleop = None
         self.policy: PreTrainedPolicy = None
 
-        self.robot_config = None
-        self.teleop_config = None
+        self.robot_config: Optional[ViamRobotConfig] = None
+        self.teleop_config: Optional[ViamTeleoperatorConfig] = None
 
         # Session tracking
         self.recording_sessions: Dict[str, Dict[str, Any]] = {}
@@ -190,9 +186,6 @@ class MyLeRobotService(Generic, EasyResource):
             )
             self.robot_config.cameras[camera_name] = camera_config
 
-        self.robot = make_robot_from_config(self.robot_config)
-        self.teleop = make_teleoperator_from_config(self.teleop_config)
-
         LOGGER.info(
             "LeRobot service configured: dataset_dir=%s, policy_dir=%s",
             self.dataset_dir, self.policy_dir
@@ -278,12 +271,10 @@ class MyLeRobotService(Generic, EasyResource):
         """Clean up resources when the service is stopped."""
         LOGGER.info("Closing LeRobot service %s", self.name)
 
-        # Disconnect robot
-        if self.robot and self.robot.is_connected:
-            self.robot.disconnect()
-
-        if self.teleop and self.teleop.is_connected:
-            self.teleop.disconnect()
+        # Cancel any active teleoperation sessions
+        for session_id, session in list(self.teleop_sessions.items()):
+            if session.task and not session.task.done():
+                session.task.cancel()
 
         # Clear state
         self.recording_sessions.clear()

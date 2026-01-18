@@ -21,7 +21,7 @@ async def viam_connect(
     api_key_value: str,
     api_key_id: str,
     robot_address: str,
-):    
+):
     """Connect to a Viam robot using API key credentials."""
     opts = RobotClient.Options.with_api_key(api_key_value, api_key_id)
     return await RobotClient.at_address(robot_address, opts)
