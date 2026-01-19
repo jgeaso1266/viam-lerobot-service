@@ -5,15 +5,17 @@ import os
 from functools import cached_property
 from typing import Any, Dict
 
+from grpclib.exceptions import GRPCError
 from viam.components.arm import Arm
 from viam.proto.component.arm import JointPositions
+from viam.proto.common import Pose
 from viam.robot.client import RobotClient
 from viam.logging import logging
 
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.robots.robot import Robot
 
-from .config_viam_robot import ViamRobotConfig
+from .config_viam_robot import ViamRobotConfig, ViamRobotEndEffectorConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -177,3 +179,123 @@ class ViamRobot(Robot):
     @cached_property
     def action_features(self) -> dict[str, type]:
         return self._joint_pos_ft
+
+
+class ViamRobotEndEffector(ViamRobot):
+    """
+    Extends ViamRobot to provide end-effector delta control.
+
+    Accepts delta actions (delta_x, delta_y, delta_z) and applies them
+    to the current end-effector position using Viam's move_to_position().
+    """
+
+    config_class = ViamRobotEndEffectorConfig
+    name = "viam_robot_ee"
+
+    def __init__(self, config: ViamRobotEndEffectorConfig):
+        super().__init__(config)
+        # Safety configuration
+        self._ee_bounds = config.end_effector_bounds
+        self._ee_step_sizes = config.end_effector_step_sizes
+        self._use_gripper = config.use_gripper
+        self._max_gripper_pos = config.max_gripper_pos
+        self._min_gripper_pos = config.min_gripper_pos
+        # Track current gripper position
+        self._current_gripper_pos = self._min_gripper_pos
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        """Return delta action features for end-effector control."""
+        features = {"delta_x": float, "delta_y": float, "delta_z": float}
+        if self._use_gripper:
+            features["gripper"] = float
+        return features
+
+    def _clamp(self, value: float, min_val: float, max_val: float) -> float:
+        """Clamp value between min and max."""
+        return max(min_val, min(value, max_val))
+
+    def send_action(self, action: Dict[str, float]) -> Dict[str, float]:
+        """Apply delta to current end-effector position with safety clamping."""
+        try:
+            current_pose = self._loop.run_until_complete(
+                self._robot_device.get_end_position()
+            )
+
+            # Clamp deltas to step sizes
+            delta_x = self._clamp(
+                action.get("delta_x", 0.0),
+                -self._ee_step_sizes["x"],
+                self._ee_step_sizes["x"]
+            )
+            delta_y = self._clamp(
+                action.get("delta_y", 0.0),
+                -self._ee_step_sizes["y"],
+                self._ee_step_sizes["y"]
+            )
+            delta_z = self._clamp(
+                action.get("delta_z", 0.0),
+                -self._ee_step_sizes["z"],
+                self._ee_step_sizes["z"]
+            )
+
+            # Calculate new position
+            new_x = current_pose.x + delta_x
+            new_y = current_pose.y + delta_y
+            new_z = current_pose.z + delta_z
+
+            # Clamp to bounds
+            new_x = self._clamp(new_x, self._ee_bounds["min"][0], self._ee_bounds["max"][0])
+            new_y = self._clamp(new_y, self._ee_bounds["min"][1], self._ee_bounds["max"][1])
+            new_z = self._clamp(new_z, self._ee_bounds["min"][2], self._ee_bounds["max"][2])
+
+            new_pose = Pose(
+                x=new_x,
+                y=new_y,
+                z=new_z,
+                o_x=current_pose.o_x,
+                o_y=current_pose.o_y,
+                o_z=current_pose.o_z,
+                theta=current_pose.theta,
+            )
+
+            LOGGER.debug(
+                f"EE move: ({current_pose.x:.2f}, {current_pose.y:.2f}, {current_pose.z:.2f}) "
+                f"-> ({new_pose.x:.2f}, {new_pose.y:.2f}, {new_pose.z:.2f})"
+            )
+
+            self._loop.run_until_complete(
+                self._robot_device.move_to_position(new_pose)
+            )
+
+            # Handle gripper if enabled
+            # Gripper action is in range 0-2 (0=CLOSE, 1=STAY, 2=OPEN)
+            # Shift to range -1 to 1 by subtracting 1, then scale by max_gripper_pos
+            if self._use_gripper and "gripper" in action:
+                gripper_delta = (action["gripper"] - 1) * self._max_gripper_pos
+                self._current_gripper_pos = self._clamp(
+                    self._current_gripper_pos + gripper_delta,
+                    self._min_gripper_pos,
+                    self._max_gripper_pos
+                )
+                LOGGER.debug(f"Gripper position: {self._current_gripper_pos:.2f}")
+
+                # TODO: more elegant way to control gripper
+                joint_positions = self._loop.run_until_complete(self._robot_device.get_joint_positions())
+                self._loop.run_until_complete(
+                    self._robot_device.move_to_joint_positions(
+                        JointPositions(
+                            values=[
+                                pos if i < self._num_joints - 1 else self._current_gripper_pos
+                                for i, pos in enumerate(joint_positions.values)
+                            ]
+                        )
+                    )
+                )
+
+        except asyncio.TimeoutError:
+            LOGGER.warning("Failed to move end-effector: timeout.")
+        except GRPCError as e:
+            LOGGER.warning(f"Failed to move end-effector: {e.message}")
+
+        return action
