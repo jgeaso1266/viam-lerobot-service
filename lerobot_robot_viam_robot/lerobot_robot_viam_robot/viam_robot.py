@@ -1,12 +1,14 @@
 """Viam implementation of Robot interface for LeRobot."""
 import asyncio
+import math
+import os
 from functools import cached_property
 from typing import Any, Dict
-import logging
 
 from viam.components.arm import Arm
 from viam.proto.component.arm import JointPositions
 from viam.robot.client import RobotClient
+from viam.logging import logging
 
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.robots.robot import Robot
@@ -39,28 +41,20 @@ class ViamRobot(Robot):
         super().__init__(config)
         self.id = config.id
         self._is_connected = False
-
-        self._api_key_id = config.api_key_id
-        self._api_key_secret = config.api_key_secret
-        self._robot_address = config.robot_address
-
         self._robot_device_name = config.robot_device_name
         self._robot_device: Arm = None
         self._num_joints = config.num_joints
-
         self._camera_device_configs = config.cameras
-        self._cameras = make_cameras_from_configs(
-            self._camera_device_configs
-        )
-
+        self.cameras = make_cameras_from_configs(self._camera_device_configs)
         self._machine = None
+        self._loop = asyncio.new_event_loop()
 
     def connect(self, calibrate: bool = True):
         """Initialize connections to robot components."""
-        self._machine = asyncio.run(viam_connect(
-            api_key_value=self._api_key_secret,
-            api_key_id=self._api_key_id,
-            robot_address=self._robot_address
+        self._machine = self._loop.run_until_complete(viam_connect(
+            api_key_value=os.environ.get("VIAM_API_KEY", ""),
+            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
+            robot_address=os.environ.get("VIAM_MACHINE_FQDN", "")
         ))
 
         self._robot_device: Arm = Arm.from_robot(self._machine, self._robot_device_name)
@@ -68,11 +62,25 @@ class ViamRobot(Robot):
         if not self._robot_device:
             raise ValueError(f"Arm '{self._robot_device_name}' not found on robot.")
 
+        # Connect cameras
+        for cam in self.cameras.values():
+            cam.connect()
+
         self._is_connected = True
 
     def disconnect(self):
         """Disconnect from robot components."""
-        asyncio.run(self._machine.close())
+        if self._machine:
+            self._loop.run_until_complete(self._machine.close())
+
+        # Cancel any remaining tasks on our loop
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+
+        for cam in self.cameras.values():
+            cam.disconnect()
+
         self._is_connected = False
         self._robot_device = None
 
@@ -98,29 +106,30 @@ class ViamRobot(Robot):
         """
         Get current observation from all robot components.
 
-        Returns dict with:
-          - "state": joint positions as list of floats
-          - "images": dict mapping camera name to image array
+        Returns flat dict with:
+          - joint positions
+          - dict mapping camera name to image array
         """
         observation: Dict[str, Any] = {}
 
         # Get joint positions from arms
         try:
-            joint_positions = asyncio.run(self._robot_device.get_joint_positions())
-            for i, pos in enumerate(joint_positions.values):
+            joint_positions = self._loop.run_until_complete(self._robot_device.get_joint_positions())
+            # joint positions are in degrees, convert to radians
+            joint_positions_rad = [math.radians(pos) for pos in joint_positions.values]
+            LOGGER.debug(f"Robot joint positions: {joint_positions_rad}")
+            for i, pos in enumerate(joint_positions_rad):
                 observation[f"joint_{i}.pos"] = pos
         except asyncio.TimeoutError:
             LOGGER.warning("Failed to get joint positions from arm.")
 
         # Get images from cameras
-        for camera_name, camera_device in self._cameras.items():
+        for camera_name, camera_device in self.cameras.items():
             try:
-                images = asyncio.run(camera_device.get_images())
-                if images:
-                    # Assuming we want the first image from the list
-                    observation[camera_name] = camera_device.async_read()
+                observation[camera_name] = camera_device.async_read()
+                LOGGER.debug(f"Got image from camera '{camera_name}'.")
             except asyncio.TimeoutError:
-                LOGGER.warning(f"Failed to get image from camera '{camera_name}'.")
+                LOGGER.warning("Failed to get image from camera '%s'.", camera_name)
 
         return observation
 
@@ -135,8 +144,14 @@ class ViamRobot(Robot):
             The action that was sent
         """
         try:
-            positions = JointPositions(values=list(action.values()))
-            asyncio.run(self._robot_device.move_to_joint_positions(positions))
+            ## joint positions are in radians, switch to degrees for Viam
+            actions_deg = [math.floor(math.degrees(pos)) for pos in action.values()]
+            positions = JointPositions(values=actions_deg)
+            LOGGER.debug(f"Sending joint positions: {positions.values}")
+            start_time = asyncio.get_event_loop().time()
+            self._loop.run_until_complete(self._robot_device.move_to_joint_positions(positions))
+            end_time = asyncio.get_event_loop().time()
+            LOGGER.debug(f"Action sent in {end_time - start_time:.4f} seconds.")
         except asyncio.TimeoutError:
             LOGGER.warning("Failed to send action to arm.")
         return action

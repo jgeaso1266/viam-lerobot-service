@@ -26,13 +26,21 @@ A generic service that wraps LeRobot functionality, enabling teleoperation of ro
 
 #### Environment Variables
 
-The service requires the following environment variables for API authentication:
+The LeRobot plugin packages (robot, teleoperator, camera) read Viam API credentials exclusively from environment variables at connection time. This keeps sensitive credentials out of configuration files and allows the same config to work across different machines.
 
-| Variable            | Description                          |
-|---------------------|--------------------------------------|
-| `VIAM_API_KEY`      | Viam API key for authentication      |
-| `VIAM_API_KEY_ID`   | Viam API key ID                      |
-| `VIAM_MACHINE_FQDN` | Fully qualified domain name of the machine |
+| Variable            | Description                          | Required |
+|---------------------|--------------------------------------|----------|
+| `VIAM_API_KEY`      | Viam API key for authentication      | Yes      |
+| `VIAM_API_KEY_ID`   | Viam API key ID                      | Yes      |
+| `VIAM_MACHINE_FQDN` | robot address of the machine | Yes      |
+
+Set these before running the service:
+
+```bash
+export VIAM_API_KEY='your-api-key'
+export VIAM_API_KEY_ID='your-api-key-id'
+export VIAM_MACHINE_FQDN='your-robot.viam.cloud'
+```
 
 #### Example Configuration
 

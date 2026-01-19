@@ -1,11 +1,12 @@
 """Viam implementation of Teleoperator interface for LeRobot."""
 import asyncio
 import math
+import os
 from typing import Any, Dict, List, Optional
-import logging
 
 from viam.components.arm import Arm
 from viam.robot.client import RobotClient
+from viam.logging import logging
 
 from lerobot.teleoperators.teleoperator import Teleoperator
 
@@ -31,24 +32,16 @@ class ViamTeleoperator(Teleoperator):
     config_class = ViamTeleoperatorConfig
     name = "viam_teleoperator"
 
-    def __init__(
-        self,
-        config: ViamTeleoperatorConfig,
-    ):
+    def __init__(self, config: ViamTeleoperatorConfig):
         super().__init__(config)
         self.id = config.id
         self._is_connected = False
         self._last_positions: Optional[List[float]] = None
-
-        self._api_key_id = config.api_key_id
-        self._api_key_secret = config.api_key_secret
-        self._robot_address = config.robot_address
-
         self._teleop_device_name = config.teleop_device_name
         self._num_joints = config.num_joints
-
         self._machine = None
         self._teleop_device: Arm = None
+        self._loop = asyncio.new_event_loop()
 
     @property
     def action_features(self) -> Dict[str, type]:
@@ -67,20 +60,19 @@ class ViamTeleoperator(Teleoperator):
 
     def connect(self, calibrate: bool = True) -> None:
         """Connect to the teleoperator device and disable torque for free movement."""
-        self._machine = asyncio.run(viam_connect(
-            api_key_value=self._api_key_secret,
-            api_key_id=self._api_key_id,
-            robot_address=self._robot_address
+        self._machine = self._loop.run_until_complete(viam_connect(
+            api_key_value=os.environ.get("VIAM_API_KEY", ""),
+            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
+            robot_address=os.environ.get("VIAM_MACHINE_FQDN", "")
         ))
 
         self._teleop_device: Arm = Arm.from_robot(self._machine, self._teleop_device_name)
         if not self._teleop_device:
             raise ValueError(f"Arm '{self._teleop_device_name}' not found on robot.")
-        
+
         self._is_connected = True
 
         # Disable torque so leader arm can be moved freely
-        asyncio.run(self._set_torque(False))
         LOGGER.info("ViamTeleoperator connected (torque disabled)")
 
     @property
@@ -93,6 +85,7 @@ class ViamTeleoperator(Teleoperator):
 
     def configure(self) -> None:
         """No additional configuration needed."""
+        self._loop.run_until_complete(self._set_torque(False))
 
     def get_action(self) -> Dict[str, float]:
         """
@@ -100,7 +93,8 @@ class ViamTeleoperator(Teleoperator):
 
         Returns dict mapping joint names to positions in radians.
         """
-        joint_positions = asyncio.run(self._teleop_device.get_joint_positions())
+        joint_positions = self._loop.run_until_complete(self._teleop_device.get_joint_positions())
+        LOGGER.debug(f"Teleoperator joint positions: {joint_positions.values}")
         return {
             f"joint_{i}.pos": math.radians(pos)
             for i, pos in enumerate(joint_positions.values)
@@ -112,7 +106,14 @@ class ViamTeleoperator(Teleoperator):
 
     def disconnect(self) -> None:
         """Disconnect from the teleoperator."""
-        asyncio.run(self._machine.close())
+        if self._machine:
+            self._loop.run_until_complete(self._machine.close())
+
+        # Cancel any remaining tasks on our loop
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+
         self._is_connected = False
         self._teleop_device = None
         LOGGER.info("ViamTeleoperator disconnected")

@@ -1,7 +1,7 @@
 """Viam implementation of Robot interface for LeRobot."""
 import asyncio
+import os
 from typing import Any
-import logging
 
 import cv2
 import numpy as np
@@ -9,6 +9,7 @@ from numpy.typing import NDArray
 
 from viam.components.camera import Camera as ViamCameraComponent
 from viam.robot.client import RobotClient
+from viam.logging import logging
 
 from lerobot.cameras.camera import Camera
 from lerobot.cameras.configs import ColorMode
@@ -39,24 +40,19 @@ class ViamCamera(Camera):
 
     def __init__(self, config: ViamCameraConfig):
         super().__init__(config)
-        self.id = config.id
+        self.color_mode = config.color_mode
         self._is_connected = False
-
-        self._api_key_id = config.api_key_id
-        self._api_key_secret = config.api_key_secret
-        self._robot_address = config.robot_address
-
         self._camera_name = config.camera_device_name
-
         self._machine = None
         self._camera: ViamCameraComponent = None
+        self._loop = asyncio.new_event_loop()
 
     def connect(self, warmup: bool = True):
         """Initialize connections to camera components."""
-        self._machine = asyncio.run(viam_connect(
-            api_key_value=self._api_key_secret,
-            api_key_id=self._api_key_id,
-            robot_address=self._robot_address
+        self._machine = self._loop.run_until_complete(viam_connect(
+            api_key_value=os.environ.get("VIAM_API_KEY", ""),
+            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
+            robot_address=os.environ.get("VIAM_MACHINE_FQDN", "")
         ))
 
         self._camera = ViamCameraComponent.from_robot(self._machine, self._camera_name)
@@ -66,7 +62,7 @@ class ViamCamera(Camera):
 
         self._is_connected = True
 
-        props = asyncio.run(self._camera.get_properties())
+        props = self._loop.run_until_complete(self._camera.get_properties())
         self.fps = props.frame_rate
         self.width = props.intrinsic_parameters.width_px
         self.height = props.intrinsic_parameters.height_px
@@ -74,15 +70,22 @@ class ViamCamera(Camera):
         if warmup:
             # Warm up camera by capturing an initial image
             try:
-                asyncio.run(self._camera.get_images())
+                self._loop.run_until_complete(self._camera.get_images())
             except asyncio.TimeoutError:
                 LOGGER.warning("Failed to warm up camera.")
 
     def disconnect(self):
         """Disconnect from camera components."""
-        asyncio.run(self._machine.close())
+        if self._machine:
+            self._loop.run_until_complete(self._machine.close())
+
+        # Cancel any remaining tasks on our loop
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+
         self._is_connected = False
-        self._camera_name = None
+        self._camera = None
 
     @property
     def is_connected(self) -> bool:
@@ -114,7 +117,7 @@ class ViamCamera(Camera):
         Returns:
             NDArray[Any]: Captured image frame as a NumPy array.
         """
-        images = asyncio.run(self._camera.get_images())
+        images = self._loop.run_until_complete(self._camera.get_images())
         if not images or len(images) == 0:
             raise RuntimeError("Failed to capture image from camera.")
 
@@ -140,7 +143,7 @@ class ViamCamera(Camera):
             NDArray[Any]: Captured image frame as a NumPy array.
         """
         try:
-            images = asyncio.run(asyncio.wait_for(
+            images = self._loop.run_until_complete(asyncio.wait_for(
                 self._camera.get_images(),
                 timeout=timeout_ms / 1000.0
             ))
@@ -156,5 +159,7 @@ class ViamCamera(Camera):
         # Convert bytes to NumPy array
         frame_buffer = np.frombuffer(frame_bytes, dtype=np.uint8)
         image = cv2.imdecode(frame_buffer, cv2.IMREAD_COLOR)
+        if self.color_mode == ColorMode.RGB:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         return image

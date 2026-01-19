@@ -154,18 +154,13 @@ class MyLeRobotService(Generic, EasyResource):
         num_joints = len(joint_positions.values)
 
         self.robot_config = ViamRobotConfig(
-            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
-            api_key_secret=os.environ.get("VIAM_API_KEY", ""),
-            robot_address=os.environ.get("VIAM_MACHINE_FQDN", ""),
             robot_device_name=arm_name,
             num_joints=num_joints
         )
 
         self.teleop_config = ViamTeleoperatorConfig(
-            api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
-            api_key_secret=os.environ.get("VIAM_API_KEY", ""),
-            robot_address=os.environ.get("VIAM_MACHINE_FQDN", ""),
-            teleop_device_name=teleop_name
+            teleop_device_name=teleop_name,
+            num_joints=num_joints
         )
 
         for cam_name in camera_names:
@@ -176,9 +171,6 @@ class MyLeRobotService(Generic, EasyResource):
             props = asyncio.run(camera.get_properties())
 
             camera_config = ViamCameraConfig(
-                api_key_id=os.environ.get("VIAM_API_KEY_ID", ""),
-                api_key_secret=os.environ.get("VIAM_API_KEY", ""),
-                robot_address=os.environ.get("VIAM_MACHINE_FQDN", ""),
                 camera_device_name=camera_name,
                 width=props.intrinsic_parameters.width_px,
                 height=props.intrinsic_parameters.height_px,

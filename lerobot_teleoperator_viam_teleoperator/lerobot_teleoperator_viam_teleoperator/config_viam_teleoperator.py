@@ -8,8 +8,5 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 @dataclass
 class ViamTeleoperatorConfig(TeleoperatorConfig):
     """Configuration for ViamTeleoperator."""
-    api_key_id: str = ""
-    api_key_secret: str = ""
-    robot_address: str = ""
     teleop_device_name: str = ""
     num_joints: int = 6
