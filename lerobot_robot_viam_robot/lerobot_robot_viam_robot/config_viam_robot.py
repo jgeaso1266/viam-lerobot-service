@@ -40,5 +40,5 @@ class ViamRobotEndEffectorConfig(ViamRobotConfig):
     )
     # Gripper configuration
     use_gripper: bool = False
-    max_gripper_pos: float = 50.0
-    min_gripper_pos: float = 5.0
+    max_gripper_pos: float = 180.0
+    min_gripper_pos: float = -180.0
