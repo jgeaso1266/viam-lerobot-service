@@ -4,6 +4,7 @@ import math
 import os
 from typing import Any, Dict, List, Optional
 
+from grpclib import GRPCError
 from viam.components.arm import Arm
 from viam.components.input import Controller, Control, Event
 from viam.robot.client import RobotClient
@@ -148,12 +149,24 @@ class ViamTeleoperator(Teleoperator):
 
     def _get_arm_action(self) -> Dict[str, float]:
         """Get action from arm teleoperator (joint positions)."""
-        joint_positions = self._loop.run_until_complete(self._teleop_device.get_joint_positions())
-        LOGGER.debug(f"Teleoperator joint positions: {joint_positions.values}")
-        return {
-            f"joint_{i}.pos": math.radians(pos)
-            for i, pos in enumerate(joint_positions.values)
-        }
+        try:
+            joint_positions = self._loop.run_until_complete(self._teleop_device.get_joint_positions())
+            LOGGER.debug(f"Teleoperator joint positions: {joint_positions.values}")
+            self._last_positions = {
+                f"joint_{i}.pos": math.radians(pos)
+                for i, pos in enumerate(joint_positions.values)
+            }
+            return self._last_positions
+        except asyncio.TimeoutError:
+            LOGGER.warning("Failed to get joint positions from teleoperator arm, using last known positions.")
+            if self._last_positions is not None:
+                return self._last_positions
+            raise RuntimeError("Failed to get joint positions and no previous positions available")
+        except GRPCError as e:
+            LOGGER.warning(f"Failed to get joint positions from teleoperator arm: {e.message}, using last known positions.")
+            if self._last_positions is not None:
+                return self._last_positions
+            raise RuntimeError(f"Failed to get joint positions ({e.message}) and no previous positions available")
 
     def _get_controller_action(self) -> Dict[str, float]:
         """Get action from controller teleoperator (delta values).

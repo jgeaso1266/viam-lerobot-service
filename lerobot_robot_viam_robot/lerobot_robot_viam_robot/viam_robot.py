@@ -50,6 +50,7 @@ class ViamRobot(Robot):
         self.cameras = make_cameras_from_configs(self._camera_device_configs)
         self._machine = None
         self._loop = asyncio.new_event_loop()
+        self._last_joint_positions: dict[str, float] | None = None
 
     def connect(self, calibrate: bool = True):
         """Initialize connections to robot components."""
@@ -120,10 +121,22 @@ class ViamRobot(Robot):
             # joint positions are in degrees, convert to radians
             joint_positions_rad = [math.radians(pos) for pos in joint_positions.values]
             LOGGER.debug(f"Robot joint positions: {joint_positions_rad}")
+            self._last_joint_positions = {}
             for i, pos in enumerate(joint_positions_rad):
                 observation[f"joint_{i}.pos"] = pos
+                self._last_joint_positions[f"joint_{i}.pos"] = pos
         except asyncio.TimeoutError:
-            LOGGER.warning("Failed to get joint positions from arm.")
+            LOGGER.warning("Failed to get joint positions from arm, using last known positions.")
+            if self._last_joint_positions is not None:
+                observation.update(self._last_joint_positions)
+            else:
+                raise RuntimeError("Failed to get joint positions and no previous positions available")
+        except GRPCError as e:
+            LOGGER.warning(f"Failed to get joint positions from arm: {e.message}, using last known positions.")
+            if self._last_joint_positions is not None:
+                observation.update(self._last_joint_positions)
+            else:
+                raise RuntimeError(f"Failed to get joint positions ({e.message}) and no previous positions available")
 
         # Get images from cameras
         for camera_name, camera_device in self.cameras.items():
@@ -151,11 +164,18 @@ class ViamRobot(Robot):
             positions = JointPositions(values=actions_deg)
             LOGGER.debug(f"Sending joint positions: {positions.values}")
             start_time = asyncio.get_event_loop().time()
-            self._loop.run_until_complete(self._robot_device.move_to_joint_positions(positions))
+            # self._loop.run_until_complete(self._robot_device.move_to_joint_positions(positions))
+            self._loop.run_until_complete(self._robot_device.do_command({
+                'command': 'set_goal_positions',
+                'positions': list(action.values())
+            }))
             end_time = asyncio.get_event_loop().time()
             LOGGER.debug(f"Action sent in {end_time - start_time:.4f} seconds.")
         except asyncio.TimeoutError:
             LOGGER.warning("Failed to send action to arm.")
+        except GRPCError as e:
+            LOGGER.warning(f"Failed to send action to arm: {e.message}")
+        
         return action
 
     @property

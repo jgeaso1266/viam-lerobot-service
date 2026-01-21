@@ -168,3 +168,4 @@ cython_debug/
 reload-*/
 
 .env
+/outputs
